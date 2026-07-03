@@ -5,6 +5,8 @@ info:
 security:
     - WorldMonitorKey: []
     - ApiKeyHeader: []
+servers:
+    - url: https://api.worldmonitor.app
 paths:
     /api/research/v1/list-arxiv-papers:
         get:
@@ -80,6 +82,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -153,6 +161,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -226,6 +240,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -262,7 +282,9 @@ paths:
                     type: boolean
                 - name: limit
                   in: query
-                  description: Max events to return (0 = unlimited).
+                  description: |-
+                    Max events to return. The handler clamps this to the range 1-200 and defaults to 50
+                     when omitted; 0 is not unlimited (it clamps up to 1).
                   required: false
                   example: 25
                   schema:
@@ -270,7 +292,9 @@ paths:
                     format: int32
                 - name: days
                   in: query
-                  description: Events within N days from now (0 = unlimited).
+                  description: |-
+                    Events within N days from now. The handler clamps this to the range 1-365 and defaults
+                     to 90 when omitted; 0 is not unlimited (it clamps up to 1).
                   required: false
                   example: 7
                   schema:
@@ -296,7 +320,7 @@ paths:
                                       "endDate": "2026-01-15"
                                       "id": "example-id"
                                       "location": "example"
-                                "lastUpdated": "2026-01-15"
+                                "lastUpdated": "2026-01-15T12:00:00.000Z"
                             schema:
                                 $ref: '#/components/schemas/ListTechEventsResponse'
                 "400":
@@ -311,6 +335,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -346,6 +376,26 @@ components:
                     type: string
                     description: Error message (e.g., 'user not found', 'database connection failed')
             description: Error is returned when a handler encounters an error. It contains a simple error message that the developer can customize.
+        ForbiddenError:
+            type: object
+            properties:
+                error:
+                    type: string
+                    description: Human-readable entitlement failure reason.
+                requiredTier:
+                    type: integer
+                    format: int32
+                    description: Minimum entitlement tier required for this endpoint.
+                currentTier:
+                    type: integer
+                    format: int32
+                    description: Caller entitlement tier when known.
+                planKey:
+                    type: string
+                    description: Caller plan key when known.
+            required:
+                - error
+            description: Returned when a PRO-gated endpoint denies access because the caller has no resolved authenticated user, entitlements cannot be verified, or the caller lacks the required entitlement tier.
         FieldViolation:
             type: object
             properties:
@@ -577,12 +627,16 @@ components:
                     maximum: 500
                     minimum: 0
                     format: int32
-                    description: Max events to return (0 = unlimited).
+                    description: |-
+                        Max events to return. The handler clamps this to the range 1-200 and defaults to 50
+                         when omitted; 0 is not unlimited (it clamps up to 1).
                 days:
                     type: integer
                     minimum: 0
                     format: int32
-                    description: Events within N days from now (0 = unlimited).
+                    description: |-
+                        Events within N days from now. The handler clamps this to the range 1-365 and defaults
+                         to 90 when omitted; 0 is not unlimited (it clamps up to 1).
             description: ListTechEventsRequest specifies filters for retrieving tech events.
         ListTechEventsResponse:
             type: object

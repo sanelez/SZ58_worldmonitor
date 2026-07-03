@@ -38,74 +38,46 @@
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  serialize,
+  eq,
+  readPublicNoAuthPaths,
+  readEndpointEntitlements,
+  readPremiumRpcPaths,
+  PUBLIC_FORBIDDEN_GATES,
+} from './lib/openapi-codegen.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const apiDir = resolve(root, 'docs/api');
 const bundlePath = resolve(apiDir, 'worldmonitor.openapi.yaml');
-const gatewayPath = resolve(root, 'server/gateway.ts');
-const entitlementPath = resolve(root, 'server/_shared/entitlement-check.ts');
-const premiumPathsPath = resolve(root, 'src/shared/premium-paths.ts');
 
 const CHECK = process.argv.includes('--check');
 
-// Genuinely public RPCs (no API key) — sourced from the single source of truth
-// in server/gateway.ts so the two can never drift. These operations opt out of
-// the root security requirement (security: []) and carry no 401. Fails closed:
-// if the set can't be parsed, we refuse to run rather than mislabel a public
-// endpoint as authenticated (or vice-versa).
-function readPublicNoAuthPaths() {
-  const src = readFileSync(gatewayPath, 'utf8');
-  const block = src.match(/PUBLIC_NO_AUTH_RPC_PATHS\s*=\s*new Set<string>\(\[([\s\S]*?)\]\)/);
-  if (!block) throw new Error(`could not locate PUBLIC_NO_AUTH_RPC_PATHS in ${gatewayPath}`);
-  const paths = [...block[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
-  if (paths.length === 0) throw new Error('PUBLIC_NO_AUTH_RPC_PATHS parsed as empty — refusing to run');
-  return new Set(paths);
-}
+// PUBLIC_PATHS / ENDPOINT_ENTITLEMENTS / PREMIUM_RPC_PATHS are parsed from the
+// gateway-adjacent source of truth (scripts/lib/openapi-codegen.mjs) so the
+// published auth contract can never drift from runtime; the parsers fail closed.
+// Bearer auth is stamped only on entitlement + legacy-Pro paths — the only ops
+// for which the gateway resolves a Clerk bearer session.
 const PUBLIC_PATHS = readPublicNoAuthPaths();
-
-// Bearer auth is not a universal replacement for an API key. The gateway only
-// resolves Clerk bearer sessions for endpoint-entitlement gates and legacy Pro
-// paths, so stamp BearerAuth at operation level only for those exact paths.
-function readEndpointEntitlements() {
-  const src = readFileSync(entitlementPath, 'utf8');
-  const block = src.match(/ENDPOINT_ENTITLEMENTS\s*:\s*Record<string,\s*number>\s*=\s*\{([\s\S]*?)\};/);
-  if (!block) throw new Error(`could not locate ENDPOINT_ENTITLEMENTS in ${entitlementPath}`);
-  const entries = [...block[1].matchAll(/'([^']+)'\s*:\s*(\d+)/g)]
-    .map((m) => [m[1], Number(m[2])]);
-  if (entries.length === 0) throw new Error('ENDPOINT_ENTITLEMENTS parsed as empty — refusing to run');
-  return new Map(entries);
-}
-
-function readPremiumRpcPaths() {
-  const src = readFileSync(premiumPathsPath, 'utf8');
-  const block = src.match(/PREMIUM_RPC_PATHS\s*=\s*new Set<string>\(\[([\s\S]*?)\]\)/);
-  if (!block) throw new Error(`could not locate PREMIUM_RPC_PATHS in ${premiumPathsPath}`);
-  return [...block[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
-}
-
 const ENDPOINT_ENTITLEMENTS = readEndpointEntitlements();
 const ENDPOINT_ENTITLEMENT_PATHS = new Set(ENDPOINT_ENTITLEMENTS.keys());
-const BEARER_AUTH_PATHS = new Set([...ENDPOINT_ENTITLEMENT_PATHS, ...readPremiumRpcPaths()]);
+const PREMIUM_RPC_PATHS = new Set(readPremiumRpcPaths());
+const BEARER_AUTH_PATHS = new Set([...ENDPOINT_ENTITLEMENT_PATHS, ...PREMIUM_RPC_PATHS]);
 if (BEARER_AUTH_PATHS.size === 0) {
   throw new Error('bearer-auth path sources parsed as empty — refusing to run');
 }
 
-// Public RPCs can still have documented 403 gates. Lead capture intentionally
-// opts out of API-key auth at the gateway, then fails closed in the handler when
-// Cloudflare Turnstile verification fails.
-const PUBLIC_FORBIDDEN_GATES = new Map([
-  ['/api/leads/v1/submit-contact', {
-    note: 'Turnstile-gated. Missing or invalid Cloudflare Turnstile token returns 403 Bot verification failed.',
-    response: {
-      description: 'Bot verification failed.',
-      content: {
-        'application/json': {
-          schema: { $ref: '#/components/schemas/Error' },
-        },
-      },
-    },
-  }],
-]);
+// Legacy-Pro-gated paths NOT covered by the newer ENDPOINT_ENTITLEMENTS tier
+// map. The gateway still guards these via `needsLegacyProBearerGate`
+// (server/gateway.ts) and returns 403 'Pro subscription required' when the
+// caller presents no valid Pro session — but the generated spec documents no
+// 403 for them (#4599). Entitlement-gated paths are subtracted out so the
+// stricter, tier-aware entitlement 403 wins for any path that is in BOTH sets:
+// the two 403 passes then never touch the same operation, so the contract can
+// never oscillate (same invariant the PUBLIC_FORBIDDEN_GATES guard enforces).
+const PREMIUM_ONLY_PATHS = new Set(
+  [...PREMIUM_RPC_PATHS].filter((path) => !ENDPOINT_ENTITLEMENT_PATHS.has(path)),
+);
 
 // A path cannot be both PRO-entitlement-gated (ForbiddenError 403) and
 // public-bot-gated (Error 403): the two passes emit different 403 bodies for
@@ -208,6 +180,42 @@ const FORBIDDEN_RESPONSE = {
   },
 };
 
+// Legacy-Pro (needsLegacyProBearerGate) 403 for PREMIUM_ONLY_PATHS. The gateway
+// body is exactly `{ error: 'Pro subscription required' }`
+// (createGatewayAuthErrorResponse → { error: normalizeAuthError(...) }), so it
+// is described by ForbiddenError — whose only REQUIRED property is `error`;
+// requiredTier/currentTier/planKey are optional and simply absent on this gate.
+// It is deliberately NOT the generated `Error` schema (whose property is
+// `message`, not `error`) nor UnauthorizedError (the 401 schema). Reusing
+// ForbiddenError keeps both 403 families (tier-entitlement + legacy-Pro) on one
+// schema whose description already covers "the caller lacks the required
+// entitlement tier".
+const PREMIUM_FORBIDDEN_NOTE = 'PRO-gated. Requires an active Pro subscription.';
+
+const PREMIUM_FORBIDDEN_RESPONSE = {
+  description: 'Pro subscription required.',
+  content: {
+    'application/json': {
+      schema: { $ref: '#/components/schemas/ForbiddenError' },
+    },
+  },
+};
+
+// Account-state 403 (#4611): the gateway rejects ANY non-public keyed route when
+// a user API key resolves to an affirmatively inactive/expired entitlement
+// (gateway.ts:1073-1083 → `API access requires an active subscription`, body
+// `{ error }`). It is orthogonal to the per-route entitlement/premium gates and
+// applies to every authenticated operation, so it is documented on the plain
+// authed ops that carry no more-specific 403. Reuses ForbiddenError ({ error }).
+const INACTIVE_ACCESS_FORBIDDEN_RESPONSE = {
+  description: 'API access requires an active subscription (the API key\'s subscription is inactive or expired).',
+  content: {
+    'application/json': {
+      schema: { $ref: '#/components/schemas/ForbiddenError' },
+    },
+  },
+};
+
 const HTTP_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'options', 'head']);
 
 function entitlementNote(requiredTier) {
@@ -230,31 +238,6 @@ function appendGateNote(description, note) {
   return `${text} ${note}`;
 }
 
-// ── Byte-faithful serializer (matches protoc-gen-openapiv3 JSON output) ─────
-const sortRec = (x) =>
-  Array.isArray(x)
-    ? x.map(sortRec)
-    : x && typeof x === 'object'
-      ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, sortRec(x[k])]))
-      : x;
-
-const goEscape = (s) => {
-  let r = '';
-  for (const ch of s) {
-    const c = ch.codePointAt(0);
-    r += c === 0x3c || c === 0x3e || c === 0x26 || c === 0x2028 || c === 0x2029
-      ? '\\u' + c.toString(16).padStart(4, '0')
-      : ch;
-  }
-  return r;
-};
-
-const serialize = (obj) => goEscape(JSON.stringify(sortRec(obj)));
-
-// Order-insensitive deep-equal (keys are sorted before compare) so change
-// detection is stable across the sort-on-write round-trip.
-const eq = (a, b) => JSON.stringify(sortRec(a)) === JSON.stringify(sortRec(b));
-
 // ── Per-service JSON injection ──────────────────────────────────────────────
 function injectJson(spec) {
   let changed = false;
@@ -271,12 +254,19 @@ function injectJson(spec) {
     spec.security = ROOT_SECURITY;
     changed = true;
   }
-  if (!eq(spec.components.schemas.UnauthorizedError, UNAUTHORIZED_SCHEMA)) {
+  // UnauthorizedError backs the per-operation 401, which only NON-public ops
+  // carry. In an all-public spec (Leads/Natural/Seismology/Unrest) no op
+  // references it, so injecting it unconditionally leaves an orphaned schema —
+  // gate on the spec having at least one non-public op, mirroring ForbiddenError.
+  const hasNonPublicOp = Object.keys(spec.paths ?? {}).some((path) => !PUBLIC_PATHS.has(path));
+  if (hasNonPublicOp && !eq(spec.components.schemas.UnauthorizedError, UNAUTHORIZED_SCHEMA)) {
     spec.components.schemas.UnauthorizedError = UNAUTHORIZED_SCHEMA;
     changed = true;
   }
-  const hasEntitlementPath = Object.keys(spec.paths ?? {}).some((path) => ENDPOINT_ENTITLEMENTS.has(path));
-  if (hasEntitlementPath && !eq(spec.components.schemas.ForbiddenError, FORBIDDEN_SCHEMA)) {
+  // ForbiddenError backs ALL 403 families — tier-entitlement, legacy-Pro, and the
+  // account-state (#4611) 403 that applies to every authenticated op — so it is
+  // required whenever the spec has a non-public op (same gate as UnauthorizedError).
+  if (hasNonPublicOp && !eq(spec.components.schemas.ForbiddenError, FORBIDDEN_SCHEMA)) {
     spec.components.schemas.ForbiddenError = FORBIDDEN_SCHEMA;
     changed = true;
   }
@@ -284,6 +274,7 @@ function injectJson(spec) {
     const isPublic = PUBLIC_PATHS.has(path);
     const requiredTier = ENDPOINT_ENTITLEMENTS.get(path);
     const isEntitlementGated = requiredTier !== undefined;
+    const isPremiumOnly = PREMIUM_ONLY_PATHS.has(path);
     const publicForbiddenGate = PUBLIC_FORBIDDEN_GATES.get(path);
     for (const [method, op] of Object.entries(ops)) {
       if (!HTTP_METHODS.has(method) || !op || typeof op !== 'object') continue;
@@ -326,6 +317,27 @@ function injectJson(spec) {
           }
           if (!eq(op.responses['403'], FORBIDDEN_RESPONSE)) {
             op.responses['403'] = FORBIDDEN_RESPONSE;
+            changed = true;
+          }
+        } else if (isPremiumOnly) {
+          // Legacy-Pro bearer gate (not tier-entitlement): "Pro subscription
+          // required" 403. PREMIUM_ONLY_PATHS excludes entitlement paths, so
+          // this branch and the entitlement branch never touch the same op.
+          const nextDescription = appendGateNote(op.description, PREMIUM_FORBIDDEN_NOTE);
+          if (op.description !== nextDescription) {
+            op.description = nextDescription;
+            changed = true;
+          }
+          if (!eq(op.responses['403'], PREMIUM_FORBIDDEN_RESPONSE)) {
+            op.responses['403'] = PREMIUM_FORBIDDEN_RESPONSE;
+            changed = true;
+          }
+        } else {
+          // Plain authenticated op: no route-specific gate, but the account-state
+          // (#4611) 403 still applies to any authed route. Do not clobber a more
+          // specific 403 (handled by the branches above).
+          if (!eq(op.responses['403'], INACTIVE_ACCESS_FORBIDDEN_RESPONSE)) {
+            op.responses['403'] = INACTIVE_ACCESS_FORBIDDEN_RESPONSE;
             changed = true;
           }
         }
@@ -453,13 +465,35 @@ const YAML_FORBIDDEN_RESPONSE = [
   "                                $ref: '#/components/schemas/ForbiddenError'",
 ];
 
-const YAML_BOT_FORBIDDEN_RESPONSE = [
+function yamlPublicForbiddenResponse(gate) {
+  const description = gate?.response?.description ?? 'Bot verification failed.';
+  const schemaRef = gate?.response?.content?.['application/json']?.schema?.$ref ?? '#/components/schemas/Error';
+  return [
+    '                "403":',
+    `                    description: ${JSON.stringify(description)}`,
+    '                    content:',
+    '                        application/json:',
+    '                            schema:',
+    `                                $ref: '${schemaRef}'`,
+  ];
+}
+
+const YAML_PREMIUM_FORBIDDEN_RESPONSE = [
   '                "403":',
-  '                    description: Bot verification failed.',
+  '                    description: Pro subscription required.',
   '                    content:',
   '                        application/json:',
   '                            schema:',
-  "                                $ref: '#/components/schemas/Error'",
+  "                                $ref: '#/components/schemas/ForbiddenError'",
+];
+
+const YAML_INACTIVE_ACCESS_FORBIDDEN_RESPONSE = [
+  '                "403":',
+  "                    description: API access requires an active subscription (the API key's subscription is inactive or expired).",
+  '                    content:',
+  '                        application/json:',
+  '                            schema:',
+  "                                $ref: '#/components/schemas/ForbiddenError'",
 ];
 
 const YAML_FORBIDDEN_SCHEMA = [
@@ -718,7 +752,10 @@ function ensureYamlForbiddenSchema(lines) {
 function injectYamlEntitlementContract(text) {
   const lines = text.split('\n');
   let changed = false;
-  let matchedEntitlementPath = false;
+  // Tracks whether the ForbiddenError schema is needed — set by EITHER an
+  // entitlement path or a premium-only path, since both 403 families reference
+  // it (mirrors injectJson's `hasEntitlementPath || hasPremiumOnlyPath`).
+  let matchedForbiddenSchemaPath = false;
 
   // Look up the concrete HTTP methods of each path once. Entitlement 403s and
   // gate notes are stamped per method (a path may carry more than one, e.g.
@@ -733,7 +770,7 @@ function injectYamlEntitlementContract(text) {
     // The ForbiddenError schema tracks the presence of ANY entitlement path in
     // the spec regardless of public status, mirroring injectJson's
     // public-agnostic hasEntitlementPath — so flag it before the public opt-out.
-    matchedEntitlementPath = true;
+    matchedForbiddenSchemaPath = true;
     // Public paths opt out of auth entirely and carry no per-operation
     // entitlement 403/note: injectJson handles them in its isPublic branch, not
     // the entitlement branch, so skip the per-op stamping here (a public +
@@ -745,7 +782,34 @@ function injectYamlEntitlementContract(text) {
     }
   }
 
-  if (matchedEntitlementPath) {
+  // Legacy-Pro (premium-not-entitlement) 403s — same ForbiddenError schema, a
+  // "Pro subscription required" body. PREMIUM_ONLY_PATHS excludes entitlement
+  // paths, so no operation is stamped by both this and the entitlement loop.
+  for (const path of PREMIUM_ONLY_PATHS) {
+    const methods = methodsByPath.get(path);
+    if (!methods) continue;
+    matchedForbiddenSchemaPath = true;
+    // No premium path is public (verified against PUBLIC_NO_AUTH_RPC_PATHS), but
+    // mirror injectJson's non-public branch defensively for parity.
+    if (PUBLIC_PATHS.has(path)) continue;
+    for (const method of methods) {
+      changed = ensureYamlGateDescription(lines, path, method, PREMIUM_FORBIDDEN_NOTE) || changed;
+      changed = ensureYamlForbiddenResponse(lines, path, method, YAML_PREMIUM_FORBIDDEN_RESPONSE) || changed;
+    }
+  }
+
+  // Plain authenticated ops (non-public, non-entitlement, non-premium) still
+  // carry the account-state (#4611) 403 that applies to every authed route —
+  // mirrors injectJson's plain-authed `else` branch.
+  for (const [path, methods] of methodsByPath) {
+    if (PUBLIC_PATHS.has(path) || ENDPOINT_ENTITLEMENTS.has(path) || PREMIUM_ONLY_PATHS.has(path)) continue;
+    matchedForbiddenSchemaPath = true;
+    for (const method of methods) {
+      changed = ensureYamlForbiddenResponse(lines, path, method, YAML_INACTIVE_ACCESS_FORBIDDEN_RESPONSE) || changed;
+    }
+  }
+
+  if (matchedForbiddenSchemaPath) {
     changed = ensureYamlForbiddenSchema(lines) || changed;
   }
 
@@ -759,7 +823,7 @@ function injectYamlEntitlementContract(text) {
     if (!methods) continue;
     for (const method of methods) {
       changed = ensureYamlGateDescription(lines, path, method, gate.note) || changed;
-      changed = ensureYamlForbiddenResponse(lines, path, method, YAML_BOT_FORBIDDEN_RESPONSE) || changed;
+      changed = ensureYamlForbiddenResponse(lines, path, method, yamlPublicForbiddenResponse(gate)) || changed;
     }
   }
 
@@ -934,10 +998,13 @@ function injectYamlAuthContract(text) {
 
   const operations = enumerateYamlOperations(lines);
   const hasBearer = operations.some(({ path }) => BEARER_AUTH_PATHS.has(path));
+  // Mirror injectJson: only inject UnauthorizedError when a non-public op
+  // (which carries the 401 that references it) exists — otherwise it is orphaned.
+  const hasNonPublicOp = operations.some(({ path }) => !PUBLIC_PATHS.has(path));
 
   changed = ensureYamlRootSecurity(lines) || changed;
   changed = ensureYamlSecuritySchemes(lines, hasBearer) || changed;
-  changed = ensureYamlUnauthorizedSchema(lines) || changed;
+  if (hasNonPublicOp) changed = ensureYamlUnauthorizedSchema(lines) || changed;
 
   for (const { path, methods } of operations) {
     for (const method of methods) {

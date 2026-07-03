@@ -5,6 +5,8 @@ info:
 security:
     - WorldMonitorKey: []
     - ApiKeyHeader: []
+servers:
+    - url: https://api.worldmonitor.app
 paths:
     /api/aviation/v1/list-airport-delays:
         get:
@@ -94,6 +96,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -147,6 +155,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -196,7 +210,7 @@ paths:
                                 "flights":
                                     - "actualArrival": 1
                                       "actualDeparture": 1
-                                      "aircraftIcao24": "example"
+                                      "aircraftIcao24": "a835af"
                                       "aircraftType": "all"
                                       "cancelled": true
                                 "source": "example"
@@ -216,6 +230,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -281,6 +301,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -326,7 +352,7 @@ paths:
                                 "flights":
                                     - "actualArrival": 1
                                       "actualDeparture": 1
-                                      "aircraftIcao24": "example"
+                                      "aircraftIcao24": "a835af"
                                       "aircraftType": "all"
                                       "cancelled": true
                                 "source": "example"
@@ -344,6 +370,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -362,7 +394,7 @@ paths:
                   in: query
                   description: ICAO 24-bit transponder address (hex, e.g., "4b1805").
                   required: false
-                  example: "example"
+                  example: "a835af"
                   schema:
                     type: string
                 - name: callsign
@@ -414,7 +446,7 @@ paths:
                                     - "altitudeM": 1.5
                                       "callsign": "example"
                                       "groundSpeedKts": 1.5
-                                      "icao24": "example"
+                                      "icao24": "a835af"
                                       "lat": 40.7128
                                 "source": "example"
                                 "updatedAt": 1717200000000
@@ -432,6 +464,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -485,6 +523,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -601,6 +645,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -672,6 +722,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -794,6 +850,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -925,6 +987,12 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 default:
                     description: Error response
                     content:
@@ -960,6 +1028,26 @@ components:
                     type: string
                     description: Error message (e.g., 'user not found', 'database connection failed')
             description: Error is returned when a handler encounters an error. It contains a simple error message that the developer can customize.
+        ForbiddenError:
+            type: object
+            properties:
+                error:
+                    type: string
+                    description: Human-readable entitlement failure reason.
+                requiredTier:
+                    type: integer
+                    format: int32
+                    description: Minimum entitlement tier required for this endpoint.
+                currentTier:
+                    type: integer
+                    format: int32
+                    description: Caller entitlement tier when known.
+                planKey:
+                    type: string
+                    description: Caller plan key when known.
+            required:
+                - error
+            description: Returned when a PRO-gated endpoint denies access because the caller has no resolved authenticated user, entitlements cannot be verified, or the caller lacks the required entitlement tier.
         FieldViolation:
             type: object
             properties:
