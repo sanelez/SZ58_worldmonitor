@@ -14524,9 +14524,8 @@ function getRemainingForecastLlmBudgetMs(budgetStartedAtMs, stageBudgetMs) {
   const stageRemaining = budgetStartedAtMs + stageBudgetMs - Date.now();
   // The run deadline (when set) caps cumulative LLM time across all stages so
   // the seed can't outlive its 180s lock; whichever budget is tighter wins.
-  const runRemaining = forecastLlmRunDeadlineMs == null
-    ? Infinity
-    : forecastLlmRunDeadlineMs - Date.now();
+  // Single source of truth for run-remaining lives in getRemainingForecastLlmRunBudgetMs.
+  const runRemaining = getRemainingForecastLlmRunBudgetMs();
   return Math.max(0, Math.min(stageRemaining, runRemaining));
 }
 
@@ -14534,8 +14533,26 @@ function getUsableForecastLlmBudgetMs(budgetStartedAtMs, stageBudgetMs) {
   return Math.max(0, getRemainingForecastLlmBudgetMs(budgetStartedAtMs, stageBudgetMs) - FORECAST_LLM_STAGE_BUDGET_GUARD_MS);
 }
 
+// Remaining RUN-level LLM budget in ms (Infinity when no run deadline is set —
+// tests and the deep-forecast worker, which have only the per-stage budget).
+// market_implications runs LAST in afterPublish, so this is the budget that
+// starves it when upstream stages are slow (e.g. deepseek-v4-flash 30s
+// timeouts drain the shared 150s run budget before the tail stage runs). #4978.
+function getRemainingForecastLlmRunBudgetMs() {
+  return forecastLlmRunDeadlineMs == null ? Infinity : forecastLlmRunDeadlineMs - Date.now();
+}
+
 function isForecastLlmBudgetError(err) {
   return Boolean(err?.forecastLlmBudgetExhausted);
+}
+
+const FORECAST_LLM_FAILURE_BUDGET_EXHAUSTED = 'budget_exhausted';
+const FORECAST_LLM_FAILURE_PROVIDER_FAILED = 'provider_failed';
+
+function createForecastLlmFailureResult(options, failureReason) {
+  return options.returnFailureReason
+    ? { text: '', model: '', provider: '', failureReason }
+    : null;
 }
 
 function createForecastLlmHttpError(resp, usableBudgetMs = Infinity) {
@@ -14597,6 +14614,18 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
   const llmMaxTokens = options.maxTokens || 1500;
   const llmEvents = [];
   let llmAttemptIndex = 0;
+  // Failure-reason classification invariant (#4978): callForecastLLM returns
+  // FORECAST_LLM_FAILURE_BUDGET_EXHAUSTED (a benign starve — the market_implications
+  // caller preserves last-good and writes NO SEED_ERROR) ONLY when the sole cause
+  // was the shared run budget draining (a pre-call/pre-fetch budget pre-emption, or
+  // a budget-CAPPED timeout that never gave the provider its full window). Every
+  // GENUINE provider-failure branch below (HTTP error, invalid/empty response, fetch
+  // error, or a timeout that got the provider's full window) MUST set
+  // `sawProviderFailure = true` so the result is FORECAST_LLM_FAILURE_PROVIDER_FAILED
+  // and /api/health surfaces SEED_ERROR. A new provider-failure branch that forgets
+  // to set this flag would silently misreport a real outage as a benign starve.
+  let sawProviderFailure = false;
+  let sawBudgetCappedTimeout = false;
   const recordLlmAttempt = (providerName, model, ok, startedAtMs, extra = {}) => {
     llmEvents.push({
       _time: new Date().toISOString(),
@@ -14629,6 +14658,7 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
         const resp = await withRetry(async () => {
           const usableBudgetMs = getUsableForecastLlmBudgetMs(budgetStartedAtMs, stageBudgetMs);
           if (usableBudgetMs <= 0) throw createForecastLlmBudgetError(stage, budgetStartedAtMs, stageBudgetMs);
+          const attemptTimeoutMs = Math.max(1, Math.min(provider.timeout, usableBudgetMs));
           attemptT0 = Date.now();
           try {
             const response = await forecastFetch(provider.apiUrl, {
@@ -14649,9 +14679,10 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
                 temperature: options.temperature ?? 0.3,
                 ...(provider.extraBody || {}),
               }),
-              signal: AbortSignal.timeout(Math.max(1, Math.min(provider.timeout, usableBudgetMs))),
+              signal: AbortSignal.timeout(attemptTimeoutMs),
             });
             if (!response.ok) {
+              sawProviderFailure = true;
               recordLlmAttempt(provider.name, provider.model, false, attemptT0, { reason: `http_${response.status}` });
               const httpErr = createForecastLlmHttpError(
                 response,
@@ -14665,8 +14696,22 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
             if (!err?.__llmAttemptRecorded && !isForecastLlmBudgetError(err)) {
               err.__llmAttemptRecorded = true;
               const name = err?.name;
+              const timedOut = name === 'TimeoutError' || name === 'AbortError';
+              // Attribute a timeout to the run budget (not the provider) ONLY when
+              // this attempt's timeout was itself CAPPED below the provider's own
+              // timeout (attemptTimeoutMs < provider.timeout) AND the run budget is
+              // now exhausted — i.e. we never gave the provider its full window, so
+              // we cannot call this a provider failure. When the call gets the full
+              // provider.timeout (the MARKET_IMPLICATIONS_MIN_RUN_BUDGET_MS >= 30s
+              // guard guarantees this for admitted market_implications calls), a
+              // timeout is unambiguously a provider failure -> sawProviderFailure.
+              const budgetCappedTimeout = timedOut
+                && attemptTimeoutMs < provider.timeout
+                && getUsableForecastLlmBudgetMs(budgetStartedAtMs, stageBudgetMs) <= 0;
+              if (budgetCappedTimeout) sawBudgetCappedTimeout = true;
+              else sawProviderFailure = true;
               recordLlmAttempt(provider.name, provider.model, false, attemptT0, {
-                reason: name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'fetch_error',
+                reason: timedOut ? 'timeout' : 'fetch_error',
               });
             }
             throw err;
@@ -14678,6 +14723,7 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
           json = await resp.json();
         } catch (err) {
           console.warn(`  [LLM:${stage}] ${provider.name} invalid response: ${err.message}`);
+          sawProviderFailure = true;
           recordLlmAttempt(provider.name, provider.model, false, attemptT0, { reason: 'invalid_json' });
           continue;
         }
@@ -14688,6 +14734,7 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
         };
         const text = json.choices?.[0]?.message?.content?.trim();
         if (!text || text.length < 20) {
+          sawProviderFailure = true;
           recordLlmAttempt(provider.name, provider.model, false, attemptT0, { ...tokensExtra, reason: 'empty' });
           continue;
         }
@@ -14699,10 +14746,22 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
         // All real attempts were recorded inside the retry callback; budget
         // pre-emptions never sent the prompt, so nothing to record here.
         console.warn(`  [LLM:${stage}] ${provider.name} ${err.message}`);
-        if (isForecastLlmBudgetError(err)) return null;
+        if (isForecastLlmBudgetError(err)) {
+          return createForecastLlmFailureResult(
+            options,
+            sawProviderFailure ? FORECAST_LLM_FAILURE_PROVIDER_FAILED : FORECAST_LLM_FAILURE_BUDGET_EXHAUSTED,
+          );
+        }
       }
     }
-    return null;
+    return createForecastLlmFailureResult(
+      options,
+      sawProviderFailure
+        ? FORECAST_LLM_FAILURE_PROVIDER_FAILED
+        : sawBudgetCappedTimeout
+          ? FORECAST_LLM_FAILURE_BUDGET_EXHAUSTED
+          : FORECAST_LLM_FAILURE_PROVIDER_FAILED,
+    );
   } finally {
     await emitForecastLlmEvents(llmEvents);
   }
@@ -16373,6 +16432,19 @@ const MARKET_IMPLICATIONS_META_TTL = 86400 * 7;
 // fingerprint is not model-sensitive, so retire old-model rows explicitly.
 const MARKET_IMPLICATIONS_STAGE_CACHE_PREFIX = 'forecast:llm-market-implications:v2:';
 
+// A market_implications completion needs ~20s wall-clock (observed 2026-07-06),
+// and the primary provider (openrouter deepseek-v4-flash) has a 25s call timeout.
+// Admit the tail stage only when the shared run budget (#4978) still covers the
+// FULL provider timeout PLUS the 5s stage guard that getUsableForecastLlmBudgetMs
+// subtracts (25_000 + 5_000 = 30_000). Below that, an admitted call is timeout-
+// CAPPED below the provider's own timeout, which is indistinguishable from a
+// genuinely hung provider — so it would either waste a doomed request (needs
+// ~20s, gets <20s) OR misreport a real provider timeout as a benign starve and
+// suppress a legitimate SEED_ERROR. Skipping instead preserves last-good honestly
+// (age-based STALE_SEED still escalates past 2h). Keep >= max(provider.timeout in
+// FORECAST_LLM_PROVIDERS) + FORECAST_LLM_STAGE_BUDGET_GUARD_MS.
+const MARKET_IMPLICATIONS_MIN_RUN_BUDGET_MS = 30_000;
+
 // Input-hash guard for the market_implications LLM stage (#4894). This was
 // the only forecast stage with no pre-call cache — a 2,500-token completion
 // regenerated every hourly run (plus every triggered re-run) even when the
@@ -16420,6 +16492,44 @@ async function writeMarketImplicationsFailureMeta(reason) {
   }
 }
 
+// A budget-starve is NOT a producer failure — it's resource contention from
+// slow upstream stages consuming the shared 150s run budget before this tail
+// stage runs (#4978). Unlike writeMarketImplicationsFailureMeta, this preserves
+// last-good seed-meta without advancing fetchedAt: existing OK meta is TTL-
+// refreshed, and stale error meta is replaced only when the canonical payload
+// still contains last-good cards with a generatedAt timestamp. Age-based
+// STALE_SEED (maxStaleMin=120) still escalates if the starve persists past 2h,
+// exactly like the gpsjam preserve-last-good design, while a single starved
+// tick stays green.
+async function preserveMarketImplicationsLastGoodOnStarve() {
+  const { url, token } = getRedisCredentials();
+  let currentMeta = null;
+  let lastGoodMeta = null;
+  try {
+    currentMeta = await redisGet(url, token, MARKET_IMPLICATIONS_META_KEY);
+    if (currentMeta?.status !== 'ok') {
+      const currentPayload = await redisGet(url, token, MARKET_IMPLICATIONS_KEY);
+      const cards = Array.isArray(currentPayload?.cards) ? currentPayload.cards : [];
+      const generatedAtMs = Date.parse(currentPayload?.generatedAt || '');
+      if (cards.length > 0 && Number.isFinite(generatedAtMs)) {
+        lastGoodMeta = { fetchedAt: generatedAtMs, recordCount: cards.length, status: 'ok' };
+      }
+    }
+  } catch (err) {
+    console.warn(`  [MarketImplications] last-good meta read failed during starve preserve: ${err.message}`);
+  }
+  try {
+    await redisCommand(url, token, ['EXPIRE', MARKET_IMPLICATIONS_KEY, String(MARKET_IMPLICATIONS_TTL)]);
+    if (currentMeta?.status === 'ok') {
+      await redisCommand(url, token, ['EXPIRE', MARKET_IMPLICATIONS_META_KEY, String(MARKET_IMPLICATIONS_META_TTL)]);
+    } else if (lastGoodMeta) {
+      await redisSet(url, token, MARKET_IMPLICATIONS_META_KEY, lastGoodMeta, MARKET_IMPLICATIONS_META_TTL);
+    }
+  } catch (err) {
+    console.warn(`  [MarketImplications] last-good preserve refresh failed: ${err.message}`);
+  }
+}
+
 async function buildAndSeedMarketImplications(inputs) {
   const startMs = Date.now();
   console.log('  [MarketImplications] Building world-state context...');
@@ -16444,6 +16554,21 @@ async function buildAndSeedMarketImplications(inputs) {
     }
   } catch { /* guard is best-effort — fall through to live generation */ }
 
+  // Tail-stage budget guard (#4978): market_implications is the LAST forecast
+  // LLM stage under the shared 150s run budget. When upstream stages are slow
+  // (e.g. deepseek-v4-flash 30s timeouts) they drain that budget before this
+  // stage runs; callForecastLLM would then throw a budget error, return null,
+  // and we'd (mis)write a SEED_ERROR for benign, self-healing resource
+  // contention. Skip gracefully and preserve last-good instead.
+  const runBudgetRemainingMs = getRemainingForecastLlmRunBudgetMs();
+  if (runBudgetRemainingMs < MARKET_IMPLICATIONS_MIN_RUN_BUDGET_MS) {
+    const remaining = Math.max(0, Math.round(runBudgetRemainingMs));
+    console.warn(`  [MarketImplications] Skipped: shared LLM run budget exhausted (${remaining}ms left, need ${MARKET_IMPLICATIONS_MIN_RUN_BUDGET_MS}ms) — preserving last-good, no SEED_ERROR`);
+    console.log(JSON.stringify({ event: 'llm_market_implications', skipped: 'run_budget_exhausted', remainingMs: remaining }));
+    await preserveMarketImplicationsLastGoodOnStarve();
+    return;
+  }
+
   const userPrompt = `World state as of ${new Date().toISOString()}:\n\n${context}\n\nAllowed tickers: ${[...ALL_ALLOWED_TICKERS].join(', ')}`;
 
   const llmOptions = getForecastLlmCallOptions('market_implications');
@@ -16452,9 +16577,18 @@ async function buildAndSeedMarketImplications(inputs) {
     stage: 'market_implications',
     maxTokens: 2500,
     temperature: 0.25,
+    returnFailureReason: true,
   });
 
   if (!result?.text) {
+    // A budget-exhausted result is the same benign starve as the pre-call guard.
+    // Genuine provider failures stay visible even if they consume the last run
+    // milliseconds before returning. (#4978)
+    if (result?.failureReason === FORECAST_LLM_FAILURE_BUDGET_EXHAUSTED) {
+      console.warn('  [MarketImplications] LLM run budget exhausted mid-call — preserving last-good, no SEED_ERROR');
+      await preserveMarketImplicationsLastGoodOnStarve();
+      return;
+    }
     console.warn('  [MarketImplications] LLM returned no response — writing error seed-meta');
     await writeMarketImplicationsFailureMeta('llm_no_response');
     return;
@@ -16556,6 +16690,19 @@ if (_isDirectRun) {
       if (triggerContext.triggerRequest) {
         await clearForecastRefreshRequestIfUnchanged(triggerContext.triggerRequest);
       }
+
+      // market_implications is the last remaining LLM stage and shares the 150s
+      // run budget (#4978). Run it BEFORE the best-effort telemetry below
+      // (history + deep-forecast snapshots, ~20s R2 trace export) so their
+      // wall-clock can't push the tail stage past the run deadline and starve
+      // it into a (pre-fix) SEED_ERROR. Independent of that telemetry — it reads
+      // data.inputs and publishes to its own key.
+      try {
+        await buildAndSeedMarketImplications(data.inputs || {});
+      } catch (err) {
+        console.warn(`  [MarketImplications] Stage failed: ${err.message}`);
+      }
+
       try {
         const snapshot = await appendHistorySnapshot(data);
         console.log(`  History appended: ${snapshot.predictions.length} forecasts -> ${HISTORY_KEY}`);
@@ -16637,12 +16784,6 @@ if (_isDirectRun) {
       } catch (err) {
         console.warn(`  [Trace] Export failed: ${err.message}`);
         if (err.stack) console.warn(`  [Trace] Stack: ${err.stack.split('\n').slice(0, 3).join(' | ')}`);
-      }
-
-      try {
-        await buildAndSeedMarketImplications(data.inputs || {});
-      } catch (err) {
-        console.warn(`  [MarketImplications] Stage failed: ${err.message}`);
       }
     },
     extraKeys: FORECAST_EXTRA_KEYS,
