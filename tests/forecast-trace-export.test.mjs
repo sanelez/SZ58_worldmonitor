@@ -534,9 +534,11 @@ describe('forecast trace artifact builder', () => {
 describe('market transmission macro state', () => {
   it('uses live-shaped macro and market payloads to form energy-aware world signals and keep market consequences selective', () => {
     const fredSeries = (seriesId, observations) => ({
-      seriesId,
-      title: seriesId,
-      observations: observations.map(([date, value]) => ({ date, value })),
+      series: {
+        seriesId,
+        title: seriesId,
+        observations: observations.map(([date, value]) => ({ date, value })),
+      },
     });
 
     const conflict = makePrediction('conflict', 'Middle East', 'Hormuz escalation risk', 0.73, 0.64, '7d', [
@@ -652,6 +654,31 @@ describe('market transmission macro state', () => {
     assert.ok((marketConsequences?.internalCount || 0) >= (marketConsequences?.items?.length || 0));
     assert.ok((marketConsequences?.items?.length || 0) <= 6);
     assert.ok((marketConsequences?.blockedCount || 0) >= 1);
+  });
+
+  it('continues accepting legacy flat FRED observations for macro signals', () => {
+    const worldState = buildForecastRunWorldState({
+      predictions: [],
+      inputs: {
+        fredSeries: {
+          VIXCLS: {
+            seriesId: 'VIXCLS',
+            title: 'VIXCLS',
+            observations: [
+              { date: '2026-02-01', value: 17.9 },
+              { date: '2026-03-01', value: 24.2 },
+            ],
+          },
+        },
+      },
+    });
+
+    const vixSignal = (worldState.worldSignals?.signals || []).find((item) => (
+      item.type === 'volatility_shock' &&
+      item.sourceType === 'fred' &&
+      item.sourceKey === 'VIXCLS'
+    ));
+    assert.ok(vixSignal);
   });
 
   it('promotes direct core-bucket market consequences when critical signals are strong even if macro coverage is incomplete', () => {
